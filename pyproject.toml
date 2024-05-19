@@ -23,6 +23,8 @@ dependencies = [
     "typing-extensions",
     "sentencepiece",
     "protobuf",
+    "deap",
+    "numpy"
 ]
 
 [project.optional-dependencies]

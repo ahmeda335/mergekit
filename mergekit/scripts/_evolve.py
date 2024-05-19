@@ -13,9 +13,26 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program. If not, see http://www.gnu.org/licenses/.
 
+
+import random
+import numpy
+import pandas as pd
+from deap import algorithms
+from deap import base
+from deap import creator
+from deap import tools
+import multiprocessing
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import argparse
+#from scoop import futures
+import hashlib
+import os
+
 import logging
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any
 
 import click
 import cma
@@ -221,49 +238,37 @@ def main(
         batch_size=batch_size,
         task_search_path=task_search_path,
     )
+    # ----------------------------------------------------------------------- #
+    # ---------------------- Creating the population ------------------------ #
+    # ----------------------------------------------------------------------- #
 
-    x0 = genome.initial_genotype(random=config.random_init).view(-1).numpy()  # This is the line which is responsible for 
-                                                                              # generating the initial genotype and then conducting 
-                                                                              # the evolutionary process on to get the best genotype.
+    population_size = 100
+
     # population = [genome.initial_genotype(random=config.random_init).view(-1).numpy() for _ in range(population_size)]   # Creating population of genotypes If I want to use GA.
+    def individ():
+        return genome.initial_genotype(random=config.random_init).view(-1)
 
-    xbest = x0
-    xbest_cost = np.inf
+    creator.create("FitnessMin", base.Fitness, weights=(-1.0,))  # This creates a class named 'FitnessMin', with negative weight so 'minimizing' such that I maximize it at evaluating func.
+    creator.create("Individual", np.ndarray, fitness=creator.FitnessMin)  # This creates a class named 'Individual' inherited from numpy.ndarray.
 
-    def progress_callback(es: cma.CMAEvolutionStrategy):
-        nonlocal xbest, xbest_cost
 
-        res = es.result
-        if use_wandb:
-            best_params = genome.genotype_to_param_arrays(res.xbest)  # Converting the output of the cma to a shape such that can be evaluated, or manipulated later.
-            mean_params = genome.genotype_to_param_arrays(res.xfavorite)  # Converting the output of the cma to a shape such that can be evaluated, or manipulated later.
-            run.log(
-                {
-                    "best_score": -res.fbest,
-                    "best_genome": wandb.Table(data=pandas.DataFrame(best_params)),
-                    "mean_genome": wandb.Table(data=pandas.DataFrame(mean_params)),
-                    "mean_std": genome.genotype_to_param_arrays(res.stds),
-                    "evaluations": res.evaluations,
-                },
-                commit=True,
-                step=res.evaluations,
-            )
+    toolbox = base.Toolbox()
+    toolbox.register("attr_float", individ)  # This creates only one individual with the shape of the 'genome.initial_genotype'.
+    toolbox.register("individual", tools.initRepeat, creator.Individual,
+                     toolbox.attr_float, 1)  # This will create the indiviual and transfer it to 'np.ndarray' shape.
+    # I can access any individual using 'toolbox.individual()'.
 
-        if res.fbest < xbest_cost:
-            xbest = res.xbest
-            xbest_cost = res.fbest
-            print(f"New best score: {-xbest_cost:.4f}")
-            best_yaml = genome.genotype_merge_config(xbest).to_yaml()
-            with open(os.path.join(storage_path, "best_config.yaml"), "w") as f:
-                f.write(best_yaml)
-            print(f"Merge configuration:\n{best_yaml}")
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    population = toolbox.population(n=population_size)
 
-            if use_wandb:
-                art = wandb.Artifact("best_config", type="merge_config")
-                art.add_file(os.path.join(storage_path, "best_config.yaml"))
-                run.log_artifact(art)
+    ## Note ##
+    # I can use another way for initializing population by reading it from a json file. LooK to this link at the end of the webpage.
+    # https://deap.readthedocs.io/en/master/tutorials/basic/part1.html#creating-types
 
-    def parallel_evaluate(x: List[np.ndarray]) -> List[float]:
+    # --------------------------------------------------------------------------------------------- #
+
+
+    def parallel_evaluate(x: List[np.ndarray]) -> list[tuple[Any]]:
         print(f"Received {len(x)} genotypes")
         res = strat.evaluate_genotypes(x)  # We note that function 'evaluate_genotypes' takes a list of genotypes, 
                                           # then it often uses ways like multiprocessing or multitasking to keep the logic
@@ -307,34 +312,65 @@ def main(
                         commit=False,
                     )
 
-        return [-x["score"] for x in res]  # maximize
+        return [(-x["score"], ) for x in res]  # maximize
+    
+    # This is for setting the fitness of the population.
+    for i in range(len(parallel_evaluate(population))):
+        population[i].fitness.values = parallel_evaluate(population)[i]
 
-    try:
-        xbest, es = cma.fmin2(  # xbest: keep only the best evaluated solution, es: contains all available information.
-            None,  # 'None' is the objective function, but here it's set to None because the objective function is instead passed as the parallel_objective parameter.
-            parallel_objective=parallel_evaluate,
-            x0=x0,
-            sigma0=sigma0,
-            options={"maxfevals": max_fevals},  # This sets various options for the CMA-ES algorithm, with maxfevals limiting the maximum number of function evaluations to prevent excessive computation.
-            callback=progress_callback,
-            )
-        
-    ### 
-    # The cma.fmin2 function internally manages a population of solutions, 
-    # iteratively updating them based on the fitness evaluations returned by parallel_evaluate. 
-    # It uses strategies like covariance matrix adaptation to efficiently explore the solution space.
-    ###
-        xbest_cost = es.result.fbest
-    except KeyboardInterrupt:
-        ray.shutdown()
+    toolbox.register("evaluate",   parallel_evaluate, x=population)
+    toolbox.register("mate",       tools.cxUniform, indpb=0.5)  # Crossover.
+    toolbox.register("select",     tools.selTournament, tournsize=10)
+    toolbox.register("mutate",     tools.mutShuffleIndexes, indpb=0.5)
+
+
+    ngen = 100  # Gerations
+    npop = 100  # Population
+
+    hof = tools.ParetoFront()
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+
+    # Statistics
+    stats.register("avg", numpy.mean, axis=0)
+    stats.register("std", numpy.std, axis=0)
+    stats.register("min", numpy.min, axis=0)
+    stats.register("max", numpy.max, axis=0)
+
+
+    # Evolution "using algorithms".
+    pop, logbook = algorithms.eaMuPlusLambda(population, toolbox, mu=npop, lambda_=npop,
+                                              cxpb=0.7,   mutpb=0.3, ngen=ngen,
+                                              stats=stats, halloffame=hof)
+    
+    # print(pop)
+    # print(logbook)
+    
+    # Assuming 'pop' and 'logbook' are the results from the evolutionary algorithm
+    for record in logbook:
+        print(f"Generation: {record['gen']}")
+        print(f"Average Fitness: {record['avg']}")
+        print(f"Standard Deviation of Fitness: {record['std']}")
+        print(f"Minimum Fitness: {record['min']}")
+        print(f"Maximum Fitness: {record['max']}")
+        print("----------")
+
+
+    # Best Solution
+    best_solution = tools.selBest(pop, 1)[0]  # pop: the list to select from, 1: number of selection.
+    
+
+    # ----------------------------------------------------------------------------------- #
 
     print("!!! OPTIMIZATION COMPLETE !!!")
-    print(f"Best cost: {xbest_cost:.4f}")
-    print()
+    # print(f"Best cost: {best_solution:.4f}")
+    # print()
+    print("")
+    print("[{}] best_score: {}".format(logbook[-1]['gen'], logbook[-1]['min'][0]))
+
 
     # save the best merge configuration using original model references
     genome_pretty = ModelGenome(config.genome, trust_remote_code=trust_remote_code)
-    best_config = genome_pretty.genotype_merge_config(xbest)
+    best_config = genome_pretty.genotype_merge_config(best_solution)
     print("Best merge configuration:")
     print(best_config.to_yaml())
 
