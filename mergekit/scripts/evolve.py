@@ -246,6 +246,7 @@ def main(
 
     # population = [genome.initial_genotype(random=config.random_init).view(-1).numpy() for _ in range(population_size)]   # Creating population of genotypes If I want to use GA.
     def individ():
+        print("individual")
         return genome.initial_genotype(random=config.random_init).view(-1)
 
     creator.create("FitnessMin", base.Fitness, weights=(-1.0,))  # This creates a class named 'FitnessMin', with negative weight so 'minimizing' such that I maximize it at evaluating func.
